@@ -18,6 +18,8 @@ python main.py \
     --device cpu \
     --mode TEAM_CLASSIFICATION
 ```
+## Example of Classification
+![image](https://github.com/user-attachments/assets/2de5b86b-a019-43a6-b833-c24a5bae3f20)
 
 ## Model Files
 
