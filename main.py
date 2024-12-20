@@ -1,15 +1,15 @@
 import argparse
 from enum import Enum
 from typing import Iterator, List
-
 import os
 import cv2
 import numpy as np
 import supervision as sv
 from tqdm import tqdm
 from ultralytics import YOLO
-
 from team import TeamClassifier
+from collections import deque
+import matplotlib.colors as mcolors
 
 PARENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PLAYER_DETECTION_MODEL_PATH = os.path.join(PARENT_DIR, 'data/football-ball-detection-v2.pt')
@@ -48,13 +48,6 @@ class Mode(Enum):
 def get_crops(frame: np.ndarray, detections: sv.Detections) -> List[np.ndarray]:
     """
     Extract crops from the frame based on detected bounding boxes.
-
-    Args:
-        frame (np.ndarray): The frame from which to extract crops.
-        detections (sv.Detections): Detected objects with bounding boxes.
-
-    Returns:
-        List[np.ndarray]: List of cropped images.
     """
     return [sv.crop_image(frame, xyxy) for xyxy in detections.xyxy]
 
@@ -62,14 +55,6 @@ def get_crops(frame: np.ndarray, detections: sv.Detections) -> List[np.ndarray]:
 def assign_kabaddi_roles(frame, players, players_team_id):
     """
     Assigns roles to players in a Kabaddi match based on the team and count of players identified.
-
-    Parameters:
-        frame (numpy.ndarray): The current video frame (not used in this logic).
-        players (object): Contains bounding box coordinates for players (not used in this logic).
-        players_team_id (numpy.ndarray): Array of team IDs corresponding to each identified player.
-
-    Returns:
-        numpy.ndarray: Corrected team IDs with roles adjusted if a single-attacker scenario is detected.
     """
     unique_teams, counts = np.unique(players_team_id, return_counts=True)
     team_counts = dict(zip(unique_teams, counts))
@@ -95,7 +80,6 @@ def assign_kabaddi_roles(frame, players, players_team_id):
                 corrected_team_ids.append(other_team)
         players_team_id = np.array(corrected_team_ids)
 
-    # Return the assigned roles (team ids) as is if no single-attacker scenario found
     return players_team_id
 
 
@@ -114,10 +98,29 @@ def run_team_classification(source_video_path: str, device: str) -> Iterator[np.
     team_classifier = TeamClassifier(device=device)
     team_classifier.fit(crops)
 
+    # Reinitialize the frame generator without stride for full analysis
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
-    tracker = sv.ByteTrack(minimum_consecutive_frames=3)
+    video_info = sv.VideoInfo.from_video_path(source_video_path)
+    fps = video_info.fps if video_info.fps else 30.0
+    time_per_frame = 1.0 / fps
 
-    # Step 2: Inference with logic integration
+    # Set up ByteTrack and dictionaries to store player states
+    tracker = sv.ByteTrack(minimum_consecutive_frames=3)
+    player_positions_in_meters = {}
+    player_speeds = {}
+    # Store recent speeds for each player (for moving average)
+    player_speed_history = {}
+
+    # Moving average configuration
+    speed_history_length = 15  # Use the last 5 frames for averaging
+    max_human_speed = 10.0  # Maximum plausible speed in m/s
+
+    # Compute pixel-to-meter ratio (assume full frame = pitch size)
+    width_pixels = video_info.width
+    height_pixels = video_info.height
+    meter_per_pixel_x = 11.0 / width_pixels
+    meter_per_pixel_y = 8.0 / height_pixels
+
     for frame in frame_generator:
         result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
         detections = sv.Detections.from_ultralytics(result)
@@ -126,18 +129,47 @@ def run_team_classification(source_video_path: str, device: str) -> Iterator[np.
         players = detections[detections.class_id == PLAYER_CLASS_ID]
         crops = get_crops(frame, players)
         players_team_id = team_classifier.predict(crops)
-
-        # Apply Kabaddi domain logic here:
         players_team_id = assign_kabaddi_roles(frame, players, players_team_id)
 
         referees = detections[detections.class_id == REFEREE_CLASS_ID]
-
-        # Combine detections
         detections = sv.Detections.merge([players, referees])
         color_lookup = np.array(
             players_team_id.tolist() + [REFEREE_CLASS_ID] * len(referees)
         )
         labels = [str(tracker_id) for tracker_id in detections.tracker_id]
+
+        # Calculate speeds
+        for i, det_id in enumerate(detections.tracker_id):
+            if det_id is None:
+                continue
+            # Get bounding box
+            x1, y1, x2, y2 = detections.xyxy[i]
+            center_x_pixel = (x1 + x2) / 2.0
+            center_y_pixel = (y1 + y2) / 2.0
+            center_x_meter = center_x_pixel * meter_per_pixel_x
+            center_y_meter = center_y_pixel * meter_per_pixel_y
+
+            current_pos = (center_x_meter, center_y_meter)
+            if det_id in player_positions_in_meters:
+                old_pos = player_positions_in_meters[det_id]
+                dx = current_pos[0] - old_pos[0]
+                dy = current_pos[1] - old_pos[1]
+                distance = np.sqrt(dx*dx + dy*dy)
+                speed = distance / time_per_frame
+
+                # Add speed to history
+                if det_id not in player_speed_history:
+                    player_speed_history[det_id] = deque(maxlen=speed_history_length)
+                player_speed_history[det_id].append(speed)
+
+                # Compute moving average
+                avg_speed = np.mean(player_speed_history[det_id])
+                player_speeds[det_id] = min(avg_speed, max_human_speed)
+
+                # Check for implausible speeds
+                if avg_speed > max_human_speed:
+                    print(f"Warning: Unusual speed detected for player {det_id}: {avg_speed:.2f} m/s")
+            player_positions_in_meters[det_id] = current_pos
 
         annotated_frame = frame.copy()
         annotated_frame = ELLIPSE_ANNOTATOR.annotate(
@@ -146,6 +178,25 @@ def run_team_classification(source_video_path: str, device: str) -> Iterator[np.
         annotated_frame = ELLIPSE_LABEL_ANNOTATOR.annotate(
             annotated_frame, detections, labels, custom_color_lookup=color_lookup
         )
+
+        # Annotate moving average speeds
+        for i, det_id in enumerate(detections.tracker_id):
+            if det_id is None:
+                continue
+            class_id = detections.class_id[i]
+            if class_id == PLAYER_CLASS_ID:
+                avg_speed = player_speeds.get(det_id, 0.0)
+                x1, y1, x2, y2 = detections.xyxy[i]
+                text_pos = (int((x1+x2)/2), int(y1)-10)
+                speed_text = f"{avg_speed:.2f} m/s"
+                cv2.putText(
+                    annotated_frame,
+                    speed_text,
+                    text_pos,
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7, (0, 255, 0), 2, cv2.LINE_AA
+                )
+
         yield annotated_frame
 
 
