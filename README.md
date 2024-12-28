@@ -23,7 +23,15 @@ python main.py \
 
 ## Model Files
 
-The .pt model file is sourced from the SportVision repository.
+The football .pt model file is sourced from the SportVision repository.
 The team classification logic and main analytical approach are adapted from the Roboflow Sport repository https://github.com/roboflow/sports.
 
-Ensure that the .pt model file is placed or referenced correctly so that the main.py script can access it.
+And the kabbadi .pt models are fine-tuned on kabbadi dataset.
+
+
+## 2D Map of the raider
+![vlcsnap-2024-12-26-23h07m53s487](https://github.com/user-attachments/assets/842b2428-1b19-4113-af97-2023ba9e161a)
+![vlcsnap-2024-12-28-13h59m05s776](https://github.com/user-attachments/assets/25b1555d-7694-4194-ad3e-ce4a45e5ebca)
+
+## Time spend on the opponent court
+![vlcsnap-2024-12-28-14h01m20s028](https://github.com/user-attachments/assets/c830a5a5-03a2-4629-9dc0-9c7092351ff6)
